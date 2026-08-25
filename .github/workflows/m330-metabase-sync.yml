@@ -1,0 +1,48 @@
+name: M330 Metabase Sync
+
+on:
+  schedule:
+    # Runs every 4 hours. Adjust to whatever cadence makes sense for how
+    # often the underlying Metabase data actually changes — cron syntax is:
+    # minute hour day-of-month month day-of-week, always in UTC.
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+concurrency:
+  # Prevents two runs from overlapping and double-writing to the sheet
+  # (e.g. a manual run firing while the scheduled one is still going).
+  group: m330-metabase-sync
+  cancel-in-progress: false
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    # 9 tabs, each with its own Metabase card fetch (default 180s timeout,
+    # up to 3 retries with backoff if a query is slow/flaky). Worst case if
+    # several cards are simultaneously slow is well under this, but 60
+    # minutes gives real headroom without letting a truly stuck run go forever.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          # Optional overrides — only needed if these ever change from the
+          # defaults baked into sync.py. Uncomment and add as repo secrets
+          # if you need to override any of them:
+          # METABASE_URL: ${{ secrets.METABASE_URL }}
+          # GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # METABASE_DASHBOARD_ID: ${{ secrets.METABASE_DASHBOARD_ID }}
+        run: python sync.py
