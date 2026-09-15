@@ -281,22 +281,57 @@ def try_parse_date(value):
 
 
 def format_for_sheets(dt):
-    '''Formats a datetime the way Google Sheets reliably auto-recognizes as a
-    real Date/Datetime when written with value_input_option=USER_ENTERED -
-    no "T", no "Z", no offset (those are what break Sheets' auto-detection).'''
+    '''Formats a datetime as human-readable text - no "T", no "Z", no offset.
+    Used ONLY for the diff/compare step (values_equal against what's already
+    in the sheet) and for logging; the actual write to Sheets uses a real
+    serial number instead (date_to_serial) - see the note there for why.'''
     if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return dt.strftime("%Y-%m-%d")
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Google Sheets (and Excel) date serial numbers count days since this epoch.
+_SHEETS_EPOCH = datetime(1899, 12, 30)
+
+
+def date_to_serial(dt):
+    '''Converts a (possibly timezone-aware) datetime to a Sheets/Excel serial
+    number, keeping its wall-clock fields as-is - same convention as
+    format_for_sheets, which also doesn't convert the UTC offset, just drops
+    it (Metabase already returns times in the display timezone, e.g. IST).
+
+    Writing this serial number with value_input_option=RAW, together with an
+    explicit DATE/DATE_TIME number format (see sync_tab), is what actually
+    guarantees the cell becomes a real Sheets date - it removes any
+    dependence on Sheets' own string-to-date auto-detection, which is what
+    silently left values like "2026-07-30T14:30:00+05:30" sitting in the
+    sheet as plain, unconverted text instead of a real date/time.'''
+    naive = dt.replace(tzinfo=None)
+    delta = naive - _SHEETS_EPOCH
+    return delta.days + delta.seconds / 86400 + delta.microseconds / 86400e6
+
+
 def normalize_dates_in_row(row):
-    '''Rewrites any date/timestamp-looking cell in a row to Sheets-friendly
-    text. Non-date cells (IDs, names, numbers) pass through untouched.'''
-    out = []
+    '''For every date/timestamp-looking cell in `row`, returns both a
+    human-readable display string (diffing/logging only) and a Sheets serial
+    number (the actual write value - see date_to_serial). Non-date cells
+    (IDs, names, numbers) pass through unchanged in both. Also reports, per
+    column position, whether that cell held a date and whether it carried a
+    real time-of-day component (vs. a bare date at midnight).'''
+    display, write, date_flags, has_time = [], [], [], []
     for v in row:
         dt = try_parse_date(v) if isinstance(v, str) else None
-        out.append(format_for_sheets(dt) if dt is not None else v)
-    return out
+        if dt is not None:
+            display.append(format_for_sheets(dt))
+            write.append(date_to_serial(dt))
+            date_flags.append(True)
+            has_time.append(not (dt.hour == 0 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0))
+        else:
+            display.append(v)
+            write.append(v)
+            date_flags.append(False)
+            has_time.append(False)
+    return display, write, date_flags, has_time
 
 
 def fetch_card_rows(card_id, timeout=180):
@@ -308,9 +343,23 @@ def fetch_card_rows(card_id, timeout=180):
     rows = data.get("rows", [])
     cols = [c.get("display_name") or c.get("name") for c in data.get("cols", [])]
     log.info("Card %s: fetched %d rows, columns=%s", card_id, len(rows), cols)
-    # `cols` is returned alongside the rows (not just logged) so sync_tab can
-    # write a header row into a brand-new/empty tab - see sync_tab below.
-    return [normalize_dates_in_row(r) for r in rows], cols
+
+    display_rows, write_rows = [], []
+    date_col_positions, date_col_has_time = set(), set()
+    for r in rows:
+        display, write, date_flags, has_time = normalize_dates_in_row(r)
+        display_rows.append(display)
+        write_rows.append(write)
+        for i, is_date in enumerate(date_flags):
+            if is_date:
+                date_col_positions.add(i)
+                if has_time[i]:
+                    date_col_has_time.add(i)
+
+    # `cols` and the date-column info are returned alongside the rows (not
+    # just logged) so sync_tab can write a header row into a brand-new/empty
+    # tab, and force a real DATE/DATE_TIME number format on date columns.
+    return display_rows, write_rows, cols, date_col_positions, date_col_has_time
 
 
 def with_retry(fn, *args, **kwargs):
@@ -374,6 +423,55 @@ def group_contiguous_columns(letters):
     return blocks
 
 
+def emit_block_writes(letters, block_positions, row_start, row_end,
+                       display_rows, write_rows, date_col_positions, date_col_has_time,
+                       value_batch, date_batch, fmt_requests, sheet_id):
+    '''Queues the writes for one contiguous sheet-column block (`letters`,
+    with `block_positions` the matching 0-based positions in each fetched
+    row), covering sheet rows row_start..row_end inclusive. Splits the block
+    into consecutive date / non-date sub-runs:
+      - non-date cells -> `value_batch` (written USER_ENTERED, as text -
+        Sheets' own auto-detect is fine for plain numbers/strings)
+      - date cells -> `date_batch` (written RAW, as Sheets serial numbers)
+        plus a matching entry in `fmt_requests` that explicitly sets that
+        range's number format to DATE or DATE_TIME. This combination is what
+        actually fixes dates getting stuck as literal text - see
+        date_to_serial's docstring for why.
+    `display_rows`/`write_rows` must have one entry per sheet row being
+    written here (row_end - row_start + 1 of them), in row order.'''
+    idx, n = 0, len(block_positions)
+    while idx < n:
+        run_is_date = block_positions[idx] in date_col_positions
+        j = idx
+        while j < n and (block_positions[j] in date_col_positions) == run_is_date:
+            j += 1
+        run_positions = block_positions[idx:j]
+        range_name = f"{letters[idx]}{row_start}:{letters[j-1]}{row_end}"
+        if run_is_date:
+            values = [[wr[p] for p in run_positions] for wr in write_rows]
+            date_batch.append({"range": range_name, "values": values})
+            is_datetime = any(p in date_col_has_time for p in run_positions)
+            fmt_type = "DATE_TIME" if is_datetime else "DATE"
+            pattern = "yyyy-mm-dd hh:mm:ss" if is_datetime else "yyyy-mm-dd"
+            fmt_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": row_start - 1,
+                        "endRowIndex": row_end,
+                        "startColumnIndex": col_letter_to_idx(letters[idx]),
+                        "endColumnIndex": col_letter_to_idx(letters[j - 1]) + 1,
+                    },
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": fmt_type, "pattern": pattern}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            })
+        else:
+            values = [[dr[p] for p in run_positions] for dr in display_rows]
+            value_batch.append({"range": range_name, "values": values})
+        idx = j
+
+
 def sync_tab(sheet, tab_name, card_id, id_col, data_columns=None, header_row=1, timeout=180):
     '''Fetches fresh Metabase rows and reconciles them against the sheet:
     - a lecture ID not already in the sheet -> appended as a new row
@@ -382,7 +480,9 @@ def sync_tab(sheet, tab_name, card_id, id_col, data_columns=None, header_row=1, 
     - a lecture ID present with identical values -> left untouched
     Returns (fresh_rows, new_count, updated_count).'''
     ws = sheet.worksheet(tab_name)
-    fresh_rows, headers = fetch_card_rows(card_id, timeout=timeout)
+    display_rows, write_rows, headers, date_col_positions, date_col_has_time = fetch_card_rows(
+        card_id, timeout=timeout
+    )
 
     all_values = with_retry(ws.get_all_values)
 
@@ -429,61 +529,79 @@ def sync_tab(sheet, tab_name, card_id, id_col, data_columns=None, header_row=1, 
             existing_slice = row_vals
         existing_map[lec_id] = (row_number, existing_slice)
 
-    to_append, to_update = [], []
-    for r in fresh_rows:
-        lec_id = normalise_id(r[id_col])
-        fresh_slice = list(r)
+    to_append, to_update = [], []   # to_append: (display, write); to_update: (row_number, display, write)
+    for idx, dr in enumerate(display_rows):
+        wr = write_rows[idx]
+        lec_id = normalise_id(dr[id_col])
         if lec_id in existing_map:
             row_number, existing_slice = existing_map[lec_id]
             # Truncate/align lengths defensively (e.g. sheet has trailing
-            # blank padding beyond what Metabase returns).
-            cmp_existing = existing_slice[:len(fresh_slice)] if not data_columns else existing_slice
-            if not values_equal(cmp_existing, fresh_slice):
-                to_update.append((row_number, r))
+            # blank padding beyond what Metabase returns). Compared against
+            # `dr` (display text) - what's actually shown in the sheet today,
+            # including for a date column, is its DATE/DATE_TIME-formatted
+            # display value, which matches format_for_sheets' output exactly
+            # once this fix has run once - see date_to_serial.
+            cmp_existing = existing_slice[:len(dr)] if not data_columns else existing_slice
+            if not values_equal(cmp_existing, dr):
+                to_update.append((row_number, dr, wr))
         else:
-            to_append.append(r)
-
-    # --- build ALL writes for this tab as one batch (single Sheets API call,
-    # regardless of how many rows/blocks - this is what avoids hitting the
-    # 60-writes/min quota when several rows change in one run) ---
-    batch_data = []
-
-    for row_number, r in to_update:
-        if data_columns:
-            for letters, block_positions in group_contiguous_columns(data_columns):
-                block_values = [[r[p] for p in block_positions]]
-                range_name = f"{letters[0]}{row_number}:{letters[-1]}{row_number}"
-                batch_data.append({"range": range_name, "values": block_values})
-        else:
-            end_letter = idx_to_letter(len(r) - 1)
-            range_name = f"A{row_number}:{end_letter}{row_number}"
-            batch_data.append({"range": range_name, "values": [r]})
+            to_append.append((dr, wr))
     if to_update:
         log.info("[%s] queued %d row update(s)", tab_name, len(to_update))
+    if to_append:
+        log.info("[%s] queued %d new row(s)", tab_name, len(to_append))
+
+    # --- build the writes for this tab: value_batch (USER_ENTERED, non-date
+    # cells) and date_batch (RAW serial numbers, date cells) each go out as
+    # one batched Sheets API call, plus one formatting call for date_batch's
+    # ranges - 3 calls total regardless of how many rows/blocks changed, well
+    # inside the 60-writes/min quota. ---
+    value_batch, date_batch, fmt_requests = [], [], []
+    sheet_id = ws.id
+
+    for row_number, dr, wr in to_update:
+        if data_columns:
+            for letters, block_positions in group_contiguous_columns(data_columns):
+                emit_block_writes(letters, block_positions, row_number, row_number,
+                                   [dr], [wr], date_col_positions, date_col_has_time,
+                                   value_batch, date_batch, fmt_requests, sheet_id)
+        else:
+            letters = [idx_to_letter(i) for i in range(len(dr))]
+            emit_block_writes(letters, list(range(len(dr))), row_number, row_number,
+                               [dr], [wr], date_col_positions, date_col_has_time,
+                               value_batch, date_batch, fmt_requests, sheet_id)
 
     if to_append:
         start_row = len(all_values) + 1
         end_row = start_row + len(to_append) - 1
+        append_display = [dr for dr, wr in to_append]
+        append_write = [wr for dr, wr in to_append]
         if data_columns:
             for letters, block_positions in group_contiguous_columns(data_columns):
-                block_values = [[row[p] for p in block_positions] for row in to_append]
-                range_name = f"{letters[0]}{start_row}:{letters[-1]}{end_row}"
-                batch_data.append({"range": range_name, "values": block_values})
+                emit_block_writes(letters, block_positions, start_row, end_row,
+                                   append_display, append_write, date_col_positions, date_col_has_time,
+                                   value_batch, date_batch, fmt_requests, sheet_id)
         else:
-            end_letter = idx_to_letter(len(to_append[0]) - 1)
-            range_name = f"A{start_row}:{end_letter}{end_row}"
-            batch_data.append({"range": range_name, "values": to_append})
-        log.info("[%s] queued %d new row(s)", tab_name, len(to_append))
+            letters = [idx_to_letter(i) for i in range(len(append_display[0]))]
+            emit_block_writes(letters, list(range(len(append_display[0]))), start_row, end_row,
+                               append_display, append_write, date_col_positions, date_col_has_time,
+                               value_batch, date_batch, fmt_requests, sheet_id)
 
-    if batch_data:
-        with_retry(ws.batch_update, batch_data, value_input_option="USER_ENTERED")
-        log.info("[%s] wrote all changes in a single batch call", tab_name)
+    if value_batch:
+        with_retry(ws.batch_update, value_batch, value_input_option="USER_ENTERED")
+        log.info("[%s] wrote non-date changes (%d range block(s))", tab_name, len(value_batch))
+    if date_batch:
+        with_retry(ws.batch_update, date_batch, value_input_option="RAW")
+        log.info("[%s] wrote date changes as real Sheets dates (%d range block(s))", tab_name, len(date_batch))
+    if fmt_requests:
+        with_retry(ws.spreadsheet.batch_update, {"requests": fmt_requests})
+        log.info("[%s] applied DATE/DATE_TIME number format to %d date range(s)", tab_name, len(fmt_requests))
 
     if not to_append and not to_update:
         log.info("[%s] up to date, nothing changed", tab_name)
 
     time.sleep(BATCH_PAUSE_SECONDS)
-    return fresh_rows, len(to_append), len(to_update)
+    return display_rows, len(to_append), len(to_update)
 
 
 def preflight_check_tabs(sheet, expected_tabs):
