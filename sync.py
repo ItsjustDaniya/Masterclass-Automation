@@ -308,7 +308,9 @@ def fetch_card_rows(card_id, timeout=180):
     rows = data.get("rows", [])
     cols = [c.get("display_name") or c.get("name") for c in data.get("cols", [])]
     log.info("Card %s: fetched %d rows, columns=%s", card_id, len(rows), cols)
-    return [normalize_dates_in_row(r) for r in rows]
+    # `cols` is returned alongside the rows (not just logged) so sync_tab can
+    # write a header row into a brand-new/empty tab - see sync_tab below.
+    return [normalize_dates_in_row(r) for r in rows], cols
 
 
 def with_retry(fn, *args, **kwargs):
@@ -380,9 +382,33 @@ def sync_tab(sheet, tab_name, card_id, id_col, data_columns=None, header_row=1, 
     - a lecture ID present with identical values -> left untouched
     Returns (fresh_rows, new_count, updated_count).'''
     ws = sheet.worksheet(tab_name)
-    fresh_rows = fetch_card_rows(card_id, timeout=timeout)
+    fresh_rows, headers = fetch_card_rows(card_id, timeout=timeout)
 
     all_values = with_retry(ws.get_all_values)
+
+    # A brand-new/empty tab has no header row at all - the logic below treats
+    # row 1 as headers and starts reading data from row 2, so without this a
+    # first-ever sync would happily write data starting at A1 and the tab
+    # would never get headings. Only fires when row 1 is genuinely blank;
+    # an existing (already-headed) tab is left exactly as the user set it up.
+    header_row_missing = (len(all_values) == 0) or all(not c.strip() for c in all_values[0])
+    if header_row_missing and headers:
+        header_writes = []
+        if data_columns:
+            for letters, block_positions in group_contiguous_columns(data_columns):
+                header_writes.append({
+                    "range": f"{letters[0]}1:{letters[-1]}1",
+                    "values": [[headers[p] for p in block_positions]],
+                })
+        else:
+            end_letter = idx_to_letter(len(headers) - 1)
+            header_writes.append({"range": f"A1:{end_letter}1", "values": [headers]})
+        with_retry(ws.batch_update, header_writes, value_input_option="USER_ENTERED")
+        log.info("[%s] tab had no header row - wrote column headings: %s", tab_name, headers)
+        # Keep the row-number bookkeeping below consistent with a header
+        # row now existing at row 1 (so appends land at row 2, not row 1).
+        all_values = [headers] if not all_values else [headers] + all_values[1:]
+
     # Absolute sheet-column indices, used only to read EXISTING rows out of
     # the full-width sheet. Freshly fetched Metabase rows already contain
     # ONLY the data_columns fields (e.g. A-D,F-Z with no E) in that order,
