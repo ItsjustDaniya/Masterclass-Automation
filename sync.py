@@ -113,6 +113,13 @@ SHEET_CARD_MAP = {
     # instead of name-based lookup - just as reliable, and skips one API call.
     "RCB":                             {"card_id": 10807, "question": "Class wise MC to RCB ratios", "id_col": 0},
 
+    # Direct card_id used here (from the URL you shared:
+    # .../question/10816-rfds-mc?mx_course_enrolled=&lecture_date=) - same
+    # pattern as "RCB" above. id_col assumed 0 (Lecture ID first column,
+    # matching every other tab here) - if this question's first column isn't
+    # the lecture ID, change id_col to match its actual position.
+    "MOM RFDs":                        {"card_id": 10816, "question": "RFDs MC", "id_col": 0},
+
     "Retention":                       {"question": "Class wise viewer retention", "id_col": 0},
     "First 15 min":                    {"question": "First 15 min of class breakdown", "id_col": 0},
     "Time Spent":                      {"question": "MC_lecture_timespent", "id_col": 0},
